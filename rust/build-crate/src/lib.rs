@@ -135,8 +135,8 @@ impl GuestBuild {
                 let manifest_path = self.manifest_dir.join("Cargo.toml");
                 let contents =
                     std::fs::read_to_string(&manifest_path).expect("failed to read Cargo.toml");
-                let lib_name = parse_lib_name(&contents, &self.manifest_dir);
-                lib_name
+
+                parse_lib_name(&contents, &self.manifest_dir)
             }
         };
 
@@ -180,20 +180,21 @@ fn parse_lib_name(contents: &str, manifest_dir: &Path) -> String {
             in_lib_section = false;
             continue;
         }
-        if in_lib_section && trimmed.starts_with("name") {
-            if let Some(name) = extract_toml_string_value(trimmed) {
-                return name;
-            }
+        if in_lib_section
+            && trimmed.starts_with("name")
+            && let Some(name) = extract_toml_string_value(trimmed)
+        {
+            return name;
         }
     }
 
     // Fall back to package name
     for line in contents.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("name") {
-            if let Some(name) = extract_toml_string_value(trimmed) {
-                return name.replace('-', "_");
-            }
+        if trimmed.starts_with("name")
+            && let Some(name) = extract_toml_string_value(trimmed)
+        {
+            return name.replace('-', "_");
         }
     }
 
