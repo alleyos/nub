@@ -140,9 +140,7 @@ impl GuestBuild {
             }
         };
 
-        let release_dir = target_dir
-            .join(&self.target_dir_name)
-            .join("release");
+        let release_dir = target_dir.join(&self.target_dir_name).join("release");
 
         // Try common artifact patterns
         let candidates = match &self.build_kind {
@@ -226,8 +224,7 @@ pub fn write_target_json(filename: &str, contents: &str) -> PathBuf {
 
 /// Resolve a relative path against CARGO_MANIFEST_DIR.
 pub fn resolve_manifest_dir(relative_path: &str) -> PathBuf {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let resolved = PathBuf::from(&manifest_dir).join(relative_path);
     assert!(
         resolved.exists(),
