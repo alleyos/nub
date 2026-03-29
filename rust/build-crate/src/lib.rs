@@ -101,7 +101,7 @@ impl GuestBuild {
 
         // Signal to nested build.rs scripts that they're inside a guest build.
         // This prevents recursive guest builds (e.g., javm-guest-tests building itself).
-        cmd.env("JAVM_GUEST_BUILD", "1");
+        cmd.env("BUILD_CRATE_GUEST_BUILD", "1");
 
         // Use CARGO_ENCODED_RUSTFLAGS to avoid cache invalidation
         if !self.extra_rustflags.is_empty() {
