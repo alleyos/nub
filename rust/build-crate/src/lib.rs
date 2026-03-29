@@ -25,6 +25,9 @@ pub struct GuestBuild {
     pub build_kind: BuildKind,
     /// Extra flags appended to CARGO_ENCODED_RUSTFLAGS.
     pub extra_rustflags: Vec<String>,
+    /// Extra arguments passed to rustc after `--` (e.g. `--crate-type cdylib`).
+    /// When non-empty, uses `cargo rustc` instead of `cargo build`.
+    pub extra_rustc_args: Vec<String>,
     /// Extra environment variables to set (e.g. CARGO_PROFILE_RELEASE_STRIP=false).
     pub env_overrides: Vec<(String, String)>,
     /// Set RUSTC_BOOTSTRAP=1 so stable rustc accepts -Z flags.
@@ -66,8 +69,13 @@ impl GuestBuild {
         let manifest_path = self.manifest_dir.join("Cargo.toml");
 
         let mut cmd = Command::new("cargo");
-        cmd.arg("build")
-            .arg("--release")
+        // Use `cargo rustc` when we need to pass extra args to rustc (e.g. --crate-type).
+        if self.extra_rustc_args.is_empty() {
+            cmd.arg("build");
+        } else {
+            cmd.arg("rustc");
+        }
+        cmd.arg("--release")
             .arg("--manifest-path")
             .arg(&manifest_path)
             .arg("--target")
@@ -81,6 +89,11 @@ impl GuestBuild {
             BuildKind::Lib => {
                 cmd.arg("--lib");
             }
+        }
+
+        if !self.extra_rustc_args.is_empty() {
+            cmd.arg("--");
+            cmd.args(&self.extra_rustc_args);
         }
 
         // Use separate target dir to avoid deadlock
