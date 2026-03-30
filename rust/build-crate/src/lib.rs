@@ -230,7 +230,7 @@ fn extract_toml_string_value(line: &str) -> Option<String> {
     Some(unquoted.to_string())
 }
 
-/// Write a target JSON string to OUT_DIR/targets/<filename> and return the path.
+/// Write a target JSON string to `OUT_DIR/targets/<filename>` and return the path.
 pub fn write_target_json(filename: &str, contents: &str) -> PathBuf {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
     let targets_dir = PathBuf::from(&out_dir).join("targets");
