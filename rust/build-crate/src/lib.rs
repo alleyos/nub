@@ -78,8 +78,13 @@ impl GuestBuild {
             .arg("--manifest-path")
             .arg(&manifest_path)
             .arg("--target")
-            .arg(&self.target_json_path)
-            .arg("-Zbuild-std=core,alloc");
+            .arg(&self.target_json_path);
+        if cargo_supports_json_target_spec() {
+            // Rust 1.95 requires an explicit cargo unstable flag when
+            // building against a custom target JSON.
+            cmd.arg("-Zjson-target-spec");
+        }
+        cmd.arg("-Zbuild-std=core,alloc");
 
         match &self.build_kind {
             BuildKind::Bin(name) => {
@@ -179,6 +184,29 @@ impl GuestBuild {
         // Return the first candidate as the expected path (for error messages)
         candidates.into_iter().next().unwrap()
     }
+}
+
+fn cargo_supports_json_target_spec() -> bool {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let Ok(output) = Command::new(cargo).arg("--version").output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut parts = stdout.split_whitespace();
+    let _ = parts.next();
+    let Some(version) = parts.next() else {
+        return false;
+    };
+
+    let mut components = version.split('.');
+    let major = components.next().and_then(|part| part.parse::<u64>().ok());
+    let minor = components.next().and_then(|part| part.parse::<u64>().ok());
+
+    matches!((major, minor), (Some(major), Some(minor)) if (major, minor) >= (1, 95))
 }
 
 /// Parse the library name from a Cargo.toml.
