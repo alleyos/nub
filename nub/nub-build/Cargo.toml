@@ -1,9 +1,9 @@
 [package]
-name = "build-nub"
+name = "nub-build"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "build.rs helper: cross-compile a hyperlight guest crate for x86_64-unknown-none"
+description = "build.rs helper: cross-compile a nub bare-metal Arch guest crate (e.g. nub-arch-hyperlight) for a bare-metal target"
 
 [dependencies]
 build-crate = { path = "../build-crate" }
