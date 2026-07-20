@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `toolchain:` inputs mirror rust-toolchain.toml — the action's
+      # ref would otherwise override the file. Bump the pin here and
+      # in rust-toolchain.toml together (and in lockstep with
+      # alleyos/alley; see the comment in rust-toolchain.toml).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: cargo doc
+        run: cargo doc --locked --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      # nub-host-kvm uses /dev/kvm; standard ubuntu-latest runners
+      # have nested-virt available but /dev/kvm is owned by `kvm`
+      # group and not writable by the runner user. Install a udev
+      # rule that makes the device world-rw.
+      - name: Enable /dev/kvm access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Workspace tests
+        run: cargo test --locked --workspace --release
+        env:
+          RUSTFLAGS: "-D warnings"
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # No ignored advisories: this workspace's lockfile is fresh and
+      # currently audits clean. If an unfixable advisory appears, add
+      # `--ignore RUSTSEC-...` with a comment explaining the root
+      # cause and the upgrade path being waited on.
+      - name: cargo audit
+        run: cargo audit
