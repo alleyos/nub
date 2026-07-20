@@ -1,22 +1,26 @@
-//! Nub: the JAR v3 microkernel — uniform caller-facing handle.
+//! Nub: the JAR v3 microkernel substrate — uniform caller-facing handle.
 //!
-//! The [`Nub`] handle is the API callers (chain runtime, tests, RPC,
-//! `jar-apply`) link against. It hides the choice of substrate behind
-//! a single invoke surface, dispatching to one of two backends:
+//! The [`Nub`] handle hides the choice of substrate behind a single
+//! publish/invoke surface, generic over a kernel [`Personality`] `P`
+//! (the pluggable semantics layer: what published objects mean, how
+//! invocations resolve a root object). Two backends:
 //!
-//! - **Local**: runs the PVM2 (RISC-V) interpreter directly in-process via
-//!   `nub_arch_local::run_instance`. Used for tests, deterministic
-//!   replay, and any host that doesn't need real ring-0 isolation.
-//! - **Hyperlight**: ships the invocation as an RPC into a
-//!   `nub-arch-x86` guest binary running inside a Hyperlight
-//!   sandbox. The actual `Kernel<HyperlightArch>` lives guest-side;
-//!   the host holds only the sandbox + a state cache.
+//! - **Local**: the personality's in-process kernel
+//!   ([`Personality::Local`], a [`LocalKernel`] impl). Used for
+//!   tests, deterministic replay, and any host that doesn't need real
+//!   ring-0 isolation.
+//! - **Hyperlight**: ships invocations as RPCs into a bare-metal
+//!   guest binary (the personality's guest crate over the generic
+//!   `nub-arch-x86` kernel lib) running inside a Hyperlight sandbox.
+//!   The wire protocol is personality-agnostic: opaque bytes +
+//!   32-byte [`ObjHash`] keys.
 //!
-//! Both backends share the same typed publish/invoke surface — the
-//! caller publishes a `Cap::Image` (and optionally a `Cap::CNode`),
-//! publishes a `Cap::Instance` referencing them, and then invokes by
-//! the resulting instance hash.
+//! Nub itself owns no guest blob and no singleton policy — a
+//! personality entrypoint crate (e.g. `rust/javm` for JAVM) builds
+//! its guest blob, defines the typed publish surface, and constructs
+//! handles via [`Nub::new_local`] / [`Nub::create_hyperlight`].
 
+pub mod personality;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
@@ -28,18 +32,16 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
-use javm_cap::{CacheDirectory, CapHashOrRef, cap::Cap};
-use nub_arch_local::LocalArch;
 use nub_host_kvm::sandbox::{
     GuestBinary, MultiUseSandbox, SandboxConfiguration, UninitializedSandbox,
 };
-use nub_kernel::Kernel;
 
 #[cfg(feature = "heap-diag")]
 use nub_arch_x86_abi::FN_ID_NUB_HEAP_STATS;
 use nub_arch_x86_abi::InvokePacket;
 pub use nub_arch_x86_abi::{CapHash as AbiCapHash, InvocationResult, SCRATCHPAD_HEAD_LEN};
-pub use nub_kernel::{CapHash, InstanceRef, InvokeOptions, InvokeOutcome};
+pub use nub_kernel::{CapHash, InstanceRef, InvokeOptions, InvokeOutcome, ObjHash};
+pub use personality::{LocalKernel, Personality};
 
 pub const MAX_HYPERLIGHT_VCPUS: usize = nub_arch_x86_abi::MAX_EXECUTION_LANES;
 
@@ -62,43 +64,29 @@ pub struct HeapStats {
     pub available_bytes: u64,
 }
 
-/// Path to the cross-compiled Hyperlight guest blob. Set by
-/// `build.rs` via [`nub_build::build`].
-const NUB_ARCH_X86_BLOB_PATH: &str = env!("NUB_ARCH_X86_BLOB");
-
-#[derive(Clone, Copy)]
-pub(crate) struct HyperlightBlob {
-    pub(crate) label: &'static str,
-    pub(crate) path: &'static str,
+/// Uniform handle to the nub microkernel substrate, generic over the
+/// kernel personality.
+pub struct Nub<P: Personality> {
+    inner: Arc<NubInner<P>>,
 }
 
-struct HyperlightSingleton {
-    blob: HyperlightBlob,
-    options: NubOptions,
-    nub: Nub,
+// Hand-written: `#[derive(Clone)]` would wrongly bound `P: Clone`.
+impl<P: Personality> Clone for Nub<P> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
-static HYPERLIGHT_NUB: Mutex<Option<HyperlightSingleton>> = Mutex::new(None);
-
-/// Compatibility alias for older tests/benches that named the returned
-/// Hyperlight singleton borrow. `Nub` is now a cloneable handle; synchronization
-/// lives inside the handle instead of in an outer mutex guard.
-pub type HyperlightNubGuard = Nub;
-
-/// Uniform handle to the nub microkernel.
-#[derive(Clone)]
-pub struct Nub {
-    inner: Arc<NubInner>,
-}
-
-struct NubInner {
-    backend: Mutex<Backend>,
+struct NubInner<P: Personality> {
+    backend: Mutex<Backend<P>>,
     next_job_id: AtomicU64,
-    invoke_executor: Arc<InvokeExecutor>,
+    invoke_executor: Arc<InvokeExecutor<P>>,
     invoke_worker_count: usize,
 }
 
-/// Options used when constructing the process-wide Hyperlight Nub singleton.
+/// Options used when constructing a Hyperlight-backed Nub.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NubOptions {
     /// Fixed vCPU pool size for the backing sandbox. Multi-vCPU Hyperlight
@@ -149,7 +137,7 @@ impl Default for NubOptions {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InvokeRequest {
-    pub instance_hash: AbiCapHash,
+    pub root: AbiCapHash,
     pub endpoint_idx: u8,
     pub args: [u64; 4],
     pub initial_gas: u64,
@@ -168,21 +156,21 @@ struct InvokeJobState {
     ready: Condvar,
 }
 
-struct QueuedInvoke {
-    nub: Nub,
+struct QueuedInvoke<P: Personality> {
+    nub: Nub<P>,
     id: InvokeJobId,
     request: InvokeRequest,
     state: Arc<InvokeJobState>,
 }
 
-struct InvokeExecutor {
-    state: Mutex<InvokeExecutorState>,
+struct InvokeExecutor<P: Personality> {
+    state: Mutex<InvokeExecutorState<P>>,
     ready: Condvar,
     handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
-struct InvokeExecutorState {
-    queue: VecDeque<QueuedInvoke>,
+struct InvokeExecutorState<P: Personality> {
+    queue: VecDeque<QueuedInvoke<P>>,
     stopping: bool,
 }
 
@@ -238,7 +226,7 @@ impl InvokeJobState {
     }
 }
 
-impl InvokeExecutor {
+impl<P: Personality> InvokeExecutor<P> {
     fn new() -> Self {
         Self {
             state: Mutex::new(InvokeExecutorState {
@@ -270,7 +258,7 @@ impl InvokeExecutor {
         Ok(())
     }
 
-    fn enqueue(&self, job: QueuedInvoke) -> Result<()> {
+    fn enqueue(&self, job: QueuedInvoke<P>) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -299,7 +287,7 @@ impl InvokeExecutor {
         }
     }
 
-    fn next_job(&self) -> Option<QueuedInvoke> {
+    fn next_job(&self) -> Option<QueuedInvoke<P>> {
         let mut state = self
             .state
             .lock()
@@ -345,34 +333,24 @@ impl InvokeExecutor {
     }
 }
 
-impl Drop for NubInner {
+impl<P: Personality> Drop for NubInner<P> {
     fn drop(&mut self) {
         self.invoke_executor.stop_and_join();
     }
 }
 
-enum Backend {
-    /// In-process backend: the PVM2 (RISC-V) interpreter plus its own
-    /// cap directory. `cache` is the source of truth for caps published
-    /// via `Nub::put_cap*` and resolved by `Nub::invoke_cached`.
-    Local {
-        kernel: Kernel<LocalArch>,
-        cache: CacheDirectory,
-    },
-    /// Hyperlight backend: the cap directory lives guest-side as a
-    /// `static CacheDirectory<FixedState>` in `nub-arch-x86`; the host
-    /// writes via the `FN_ID_NUB_PUT_CAP` RPC and tracks published blob
-    /// hashes host-side to short-circuit idempotent re-puts (it does
-    /// *not* dereference the guest's hashbrown — see
+enum Backend<P: Personality> {
+    /// In-process backend: the personality's [`LocalKernel`] (object
+    /// store + interpreter wiring). Source of truth for objects
+    /// published via [`Nub::put_object`] and resolved by
+    /// [`Nub::invoke_cached`].
+    Local(P::Local),
+    /// Hyperlight backend: the object store lives guest-side in the
+    /// personality's guest binary; the host writes via the
+    /// `FN_ID_NUB_PUT_CAP` RPC and tracks published blob hashes
+    /// host-side to short-circuit idempotent re-puts (it does *not*
+    /// dereference the guest's hashbrown — see
     /// `MultiUseSandbox::published_blobs` for why that is unsound).
-    Hyperlight(Arc<HyperlightDriver>),
-}
-
-enum InvokeBackendTarget {
-    Local {
-        inst: Box<javm_cap::InstanceCap>,
-        img: Box<javm_cap::ImageCap>,
-    },
     Hyperlight(Arc<HyperlightDriver>),
 }
 
@@ -384,8 +362,8 @@ struct HyperlightDriver {
     state_root_cache: CapHash,
 }
 
-impl Nub {
-    /// Construct a Nub backed by the in-process [`LocalArch`].
+impl<P: Personality> Nub<P> {
+    /// Construct a Nub backed by the personality's in-process kernel.
     pub fn new_local() -> Self {
         let invoke_worker_count = thread::available_parallelism()
             .map(NonZeroUsize::get)
@@ -393,10 +371,7 @@ impl Nub {
             .clamp(2, 8);
         Self {
             inner: Arc::new(NubInner {
-                backend: Mutex::new(Backend::Local {
-                    kernel: Kernel::new(LocalArch::new()),
-                    cache: CacheDirectory::new(),
-                }),
+                backend: Mutex::new(Backend::Local(P::Local::default())),
                 next_job_id: AtomicU64::new(1),
                 invoke_executor: Arc::new(InvokeExecutor::new()),
                 invoke_worker_count,
@@ -404,73 +379,34 @@ impl Nub {
         }
     }
 
-    /// Borrow the process-wide Hyperlight-backed Nub loaded from the
-    /// `nub-arch-x86` guest blob.
-    pub fn hyperlight() -> Result<HyperlightNubGuard> {
-        Self::hyperlight_with_options(NubOptions::default())
-    }
-
-    pub fn hyperlight_with_options(options: NubOptions) -> Result<HyperlightNubGuard> {
-        Self::hyperlight_with_blob(
-            HyperlightBlob {
-                label: "production",
-                path: NUB_ARCH_X86_BLOB_PATH,
-            },
-            options,
-        )
-    }
-
-    pub(crate) fn hyperlight_with_blob(blob: HyperlightBlob, options: NubOptions) -> Result<Nub> {
-        options.validate()?;
-        let mut guard = HYPERLIGHT_NUB
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Hyperlight Nub singleton mutex poisoned"))?;
-        match guard.as_ref() {
-            Some(existing) if existing.blob.path == blob.path && existing.options == options => {}
-            Some(existing) if existing.blob.path == blob.path => {
-                return Err(anyhow::anyhow!(
-                    "Hyperlight Nub singleton already initialized with {} vCPU(s); \
-                     cannot reconfigure it to {} vCPU(s)",
-                    existing.options.vcpu_count,
-                    options.vcpu_count,
-                ));
-            }
-            Some(existing) => {
-                return Err(anyhow::anyhow!(
-                    "Hyperlight Nub singleton already initialized with {} guest ({:?}); \
-                     cannot switch to {} guest ({:?})",
-                    existing.blob.label,
-                    existing.blob.path,
-                    blob.label,
-                    blob.path,
-                ));
-            }
-            None => {
-                let nub = Self::create_hyperlight_with_blob_path(blob.path, options)?;
-                *guard = Some(HyperlightSingleton { blob, options, nub });
-            }
-        }
-        Ok(guard
-            .as_ref()
-            .expect("Hyperlight Nub singleton initialized")
-            .nub
-            .clone())
-    }
-
-    /// Create the backing sandbox for the process-wide Hyperlight singleton
-    /// from an arbitrary guest ELF on disk.
+    /// Create a Hyperlight-backed Nub from a guest ELF on disk.
     ///
-    /// This is intentionally private: high-level callers must go through the
-    /// process singleton returned by [`Self::hyperlight`].
-    fn create_hyperlight_with_blob_path(path: &str, options: NubOptions) -> Result<Self> {
+    /// **At most one per process.** The KVM substrate supports a
+    /// single live Hyperlight sandbox per process: the guest-VA
+    /// window is one process-wide fixed reservation, and every
+    /// sandbox `MAP_FIXED`-overlays its kernel-shadow at the same VA
+    /// inside it. A second construction — concurrent or sequential
+    /// (the guard is never released, even after dropping the first
+    /// sandbox) — fails loudly with
+    /// `nub_host_kvm::HyperlightError::SandboxAlreadyCreated` instead
+    /// of silently corrupting the live sandbox's guest memory.
+    /// Personality entrypoint crates own the blob paths and typically
+    /// wrap this constructor in a process-wide singleton (e.g.
+    /// `javm::Nub::hyperlight`), which reuses the one sandbox across
+    /// callers.
+    pub fn create_hyperlight(path: &str, options: NubOptions) -> Result<Self> {
+        options.validate()?;
         let mut cfg = SandboxConfiguration::default();
         cfg.set_vcpu_count(options.vcpu_count);
         cfg.set_scratch_size(512 * 1024 * 1024);
         cfg.set_input_data_size(16 * 1024 * 1024);
         cfg.set_output_data_size(16 * 1024 * 1024);
         cfg.set_heap_size(256 * 1024 * 1024);
-        let uninit = UninitializedSandbox::new(GuestBinary::FilePath(path.to_string()), Some(cfg))?;
-        let sandbox = uninit.evolve()?;
+        let uninit = UninitializedSandbox::new(GuestBinary::FilePath(path.to_string()), Some(cfg))
+            .map_err(|e| anyhow::anyhow!("create_hyperlight[{}]: {path}: {e}", P::NAME))?;
+        let sandbox = uninit
+            .evolve()
+            .map_err(|e| anyhow::anyhow!("create_hyperlight[{}]: evolve: {e}", P::NAME))?;
         Ok(Self {
             inner: Arc::new(NubInner {
                 backend: Mutex::new(Backend::Hyperlight(Arc::new(HyperlightDriver {
@@ -492,7 +428,7 @@ impl Nub {
             .lock()
             .expect("Nub backend mutex poisoned");
         match &*backend {
-            Backend::Local { kernel, .. } => kernel.state_root(),
+            Backend::Local(local) => local.state_root(),
             Backend::Hyperlight(h) => h.state_root_cache,
         }
     }
@@ -507,7 +443,7 @@ impl Nub {
             .lock()
             .expect("Nub backend mutex poisoned");
         match &mut *backend {
-            Backend::Local { .. } => Ok(()),
+            Backend::Local(_) => Ok(()),
             Backend::Hyperlight(h) => {
                 h.sandbox.evict_jit_all_parallel()?;
                 Ok(())
@@ -525,7 +461,7 @@ impl Nub {
             .lock()
             .expect("Nub backend mutex poisoned");
         match &mut *backend {
-            Backend::Local { .. } => Err(anyhow::anyhow!(
+            Backend::Local(_) => Err(anyhow::anyhow!(
                 "heap_stats: Local backend has no guest heap"
             )),
             Backend::Hyperlight(h) => {
@@ -548,62 +484,75 @@ impl Nub {
         }
     }
 
-    // --- New publish surface (caller-built `Cap`) ---
+    // --- Generic publish surface (personality-encoded bytes) ---
 
-    /// Put a caller-built `Cap` into the active cache. Computes
-    /// the cap's content hash and either clones the cap on first put or
-    /// bumps refcount on idempotent re-put. Returns the cap's content hash.
-    pub fn put_cap(&self, cap: &javm_cap::Cap) -> Result<AbiCapHash> {
+    /// Put a personality-encoded object into the active store. The
+    /// personality decodes, validates, and content-hashes the bytes;
+    /// the returned [`ObjHash`] is the content-addressed key.
+    pub fn put_object(&self, bytes: &[u8]) -> Result<ObjHash> {
         let mut backend = self
             .inner
             .backend
             .lock()
             .expect("Nub backend mutex poisoned");
         match &mut *backend {
-            Backend::Local { cache, .. } => cache
-                .put_cap(cap)
-                .map_err(|e| anyhow::anyhow!("put_cap (local): {e}")),
+            Backend::Local(local) => local.put_object(bytes),
             Backend::Hyperlight(h) => h
                 .sandbox
-                .put_cap(cap)
-                .map_err(|e| anyhow::anyhow!("put_cap: {e}")),
+                .put_object(bytes)
+                .map_err(|e| anyhow::anyhow!("put_object: {e}")),
         }
     }
 
-    /// Pre-hashed variant. Caller computed `ssz::hash_tree_root(cap)`
-    /// at warmup and passes it explicitly; on the hot idempotent
-    /// path this lets both backends skip the SSZ merkleize entirely.
-    /// Debug-asserts the claimed hash matches the cap; release trusts
-    /// the caller.
+    /// Pre-hashed variant. The caller already knows the content hash;
+    /// on the hot idempotent path this skips encode + hash entirely.
     ///
     /// Hyperlight backend: short-circuits on a host-side set of blob
-    /// hashes this sandbox has already published. On a hit, no RPC
-    /// roundtrip and no guest-side merkle walk — the typical bench /
-    /// replay workload re-publishes the same cap graph every iteration
-    /// and pays only one host-side `HashSet::contains`. (The host does
-    /// not read the guest's `CacheDirectory` directly: it is a hashbrown
-    /// table built with a different SIMD `Group` width than the host's,
-    /// so a cross-binary deref is unsound — see
-    /// `nub-host-kvm::MultiUseSandbox::published_blobs`.)
-    pub fn put_cap_with_hash(&self, hash: AbiCapHash, cap: &javm_cap::Cap) -> Result<()> {
+    /// hashes this sandbox has already published — on a hit, `bytes`
+    /// is never called: no encode, no RPC roundtrip, no guest-side
+    /// merkle walk (see
+    /// `nub-host-kvm::MultiUseSandbox::put_object_with_hash`).
+    pub fn put_object_with_hash(
+        &self,
+        hash: ObjHash,
+        bytes: impl FnOnce() -> std::result::Result<Vec<u8>, String>,
+    ) -> Result<()> {
         let mut backend = self
             .inner
             .backend
             .lock()
             .expect("Nub backend mutex poisoned");
         match &mut *backend {
-            Backend::Local { cache, .. } => cache
-                .put_cap_with_hash(hash, cap)
-                .map_err(|e| anyhow::anyhow!("put_cap_with_hash (local): {e}")),
+            Backend::Local(local) => {
+                let bytes =
+                    bytes().map_err(|e| anyhow::anyhow!("put_object_with_hash: encode: {e}"))?;
+                local.put_object_with_hash(hash, &bytes)
+            }
             Backend::Hyperlight(h) => h
                 .sandbox
-                .put_cap_with_hash(hash, cap)
-                .map_err(|e| anyhow::anyhow!("put_cap_with_hash: {e}")),
+                .put_object_with_hash(hash, bytes)
+                .map_err(|e| anyhow::anyhow!("put_object_with_hash: {e}")),
         }
     }
 
-    /// Submit an invocation to the singleton Nub and return a job handle. Jobs
-    /// are queued onto a fixed Nub-owned host executor; Hyperlight execution then
+    /// Typed escape hatch: run `f` against the personality's
+    /// [`LocalKernel`] under the backend lock. Returns `None` on the
+    /// Hyperlight backend. Personality entrypoint crates use this to
+    /// keep their typed publish paths encode-free on Local.
+    pub fn with_local<R>(&self, f: impl FnOnce(&mut P::Local) -> R) -> Option<R> {
+        let mut backend = self
+            .inner
+            .backend
+            .lock()
+            .expect("Nub backend mutex poisoned");
+        match &mut *backend {
+            Backend::Local(local) => Some(f(local)),
+            Backend::Hyperlight(_) => None,
+        }
+    }
+
+    /// Submit an invocation and return a job handle. Jobs are queued
+    /// onto a fixed Nub-owned host executor; Hyperlight execution then
     /// runs on the sandbox's fixed vCPU worker lanes.
     pub fn submit_invoke(&self, request: InvokeRequest) -> Result<InvokeJob> {
         let id = InvokeJobId(self.inner.next_job_id.fetch_add(1, Ordering::Relaxed));
@@ -620,12 +569,12 @@ impl Nub {
         Ok(InvokeJob { id, state })
     }
 
-    /// Invoke a previously-published `Cap::Instance` by hash. V0 args
-    /// are 4 u64s laid into φ[7..=10] on top of the published
-    /// endpoint's `initial_regs` baseline.
+    /// Invoke the object graph rooted at a previously-published
+    /// `root` hash. V0 args are 4 u64s overlaid per the personality's
+    /// register ABI.
     pub fn invoke_cached(
         &self,
-        instance_hash: AbiCapHash,
+        root: ObjHash,
         endpoint_idx: u8,
         args: [u64; 4],
         initial_gas: u64,
@@ -636,7 +585,7 @@ impl Nub {
         let id = self.inner.next_job_id.fetch_add(1, Ordering::Relaxed);
         self.invoke_request_blocking(
             InvokeRequest {
-                instance_hash,
+                root,
                 endpoint_idx,
                 args,
                 initial_gas,
@@ -652,7 +601,7 @@ impl Nub {
     ) -> Result<InvocationResult> {
         self.invoke_cached_raw(
             job_id,
-            request.instance_hash,
+            request.root,
             request.endpoint_idx,
             request.args,
             request.initial_gas,
@@ -663,72 +612,36 @@ impl Nub {
     fn invoke_cached_raw(
         &self,
         job_id: u64,
-        instance_hash: AbiCapHash,
+        root: ObjHash,
         endpoint_idx: u8,
         args: [u64; 4],
         initial_gas: u64,
     ) -> Result<InvocationResult> {
-        let target = {
+        let hyperlight = {
             let mut backend = self
                 .inner
                 .backend
                 .lock()
                 .expect("Nub backend mutex poisoned");
             match &mut *backend {
-                Backend::Local { cache, .. } => {
-                    // Resolve the instance + image from the in-process
-                    // cache and drive the PVM2 (RISC-V) interpreter.
-                    let instance_cap = cache
-                        .get(CapHashOrRef::Hash(instance_hash))
-                        .ok_or_else(|| anyhow::anyhow!("invoke_cached: instance not published"))?;
-                    let inst = match &*instance_cap {
-                        Cap::Instance(i) => i.clone(),
-                        _ => {
-                            return Err(anyhow::anyhow!(
-                                "invoke_cached: cap at hash is not an Instance"
-                            ));
-                        }
-                    };
-                    let image_cap = cache
-                        .get(CapHashOrRef::Hash(inst.image_hash))
-                        .ok_or_else(|| anyhow::anyhow!("invoke_cached: image not in cache"))?;
-                    let img = match &*image_cap {
-                        Cap::Image(i) => i.clone(),
-                        _ => {
-                            return Err(anyhow::anyhow!(
-                                "invoke_cached: cap at image_hash is not an Image"
-                            ));
-                        }
-                    };
-                    InvokeBackendTarget::Local {
-                        inst: Box::new(inst),
-                        img: Box::new(img),
-                    }
+                // NOTE: the Local kernel runs the invocation under the
+                // backend lock, so concurrent Local invokes serialize.
+                // Local is the test/replay backend; all its callers
+                // assert results, not concurrency.
+                Backend::Local(local) => {
+                    return local.invoke(root, endpoint_idx as u32, args, initial_gas);
                 }
-                Backend::Hyperlight(h) => InvokeBackendTarget::Hyperlight(h.clone()),
+                Backend::Hyperlight(h) => h.clone(),
             }
         };
 
-        let hyperlight = match target {
-            InvokeBackendTarget::Local { inst, img } => {
-                return Ok(nub_arch_local::run_instance(
-                    &inst,
-                    &img,
-                    endpoint_idx,
-                    args,
-                    initial_gas,
-                ));
-            }
-            InvokeBackendTarget::Hyperlight(h) => h,
-        };
-
-        // No host-side pin/unpin — the cap is owned by the guest's
-        // heap-resident DIRECTORY; there's nothing for the host to lock against
+        // No host-side pin/unpin — the object is owned by the guest's
+        // heap-resident store; there's nothing for the host to lock against
         // (the guest doesn't evict). Hyperlight invokes always go through the
         // fixed per-lane worker pool; serialized `call_raw` remains only for the
         // control plane and stops idle workers before using the legacy RPC ring.
         let packet = InvokePacket {
-            instance_hash,
+            root_hash: root,
             endpoint_idx: endpoint_idx as u32,
             _pad: 0,
             args,

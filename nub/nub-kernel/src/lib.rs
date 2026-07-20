@@ -12,13 +12,17 @@
 //!                  │
 //!         jar-apply  (block-apply, gas, quota — separate crate, later)
 //!                  │
-//!              nub  (uniform Nub handle over backends)
+//!             javm  (JAVM entrypoint: Javm personality, typed Cap
+//!                  │  surface, guest blob + Hyperlight singleton)
+//!                  │
+//!              nub  (generic Nub<P: Personality> handle over backends)
 //!                  │
 //!     ┌────────────┼────────────────┐
 //!     │                             │
 //! nub-arch-local        nub-arch-x86
-//! (in-process,         (bare-metal guest,
-//!  std)                 no_std + no_main)
+//! (in-process,         (generic bare-metal guest-kernel lib;
+//!  std)                 javm-guest-x86 supplies the personality
+//!     │                 + binaries, no_std + no_main)
 //!     │                             │
 //!     └────────────┬────────────────┘
 //!                  │
@@ -43,10 +47,14 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-/// 32-byte content hash. Same shape as `javm_cap::CapHash`; defined
-/// here locally so this crate stays `no_std`. A future unification
-/// pass will share the type once `javm-cap` becomes `no_std`-clean.
-pub type CapHash = [u8; 32];
+/// 32-byte content hash of a published state object. The personality
+/// defines the hash function (JAVM: SSZ `hash_tree_root`); nub treats
+/// the value as an opaque content-addressed key.
+pub type ObjHash = [u8; 32];
+
+/// Legacy alias for [`ObjHash`] from when the only personality was the
+/// JAVM capability system. Prefer [`ObjHash`] in new code.
+pub type CapHash = ObjHash;
 
 /// Opaque, 32-byte handle to an Instance held by an `Arch`.
 ///
