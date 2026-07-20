@@ -5,9 +5,10 @@
 [upstream]
 # The monorepo this repository mirrors a subtree of.
 repo = "github.com/alleyos/alley"
-# The mirror boundary: the synced trees, used verbatim as the
-# format-patch pathspec. Everything outside these paths is
-# repo-local and never syncs in either direction.
+# The mirror boundary: the synced trees, used as the format-patch
+# pathspec (trailing slash optional — git selects the same file set
+# either way). Everything outside these paths is repo-local and
+# never syncs in either direction.
 paths = ["nub/", "rust/build-crate/"]
 
 [state]
