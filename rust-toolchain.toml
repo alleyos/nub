@@ -1,0 +1,9 @@
+[toolchain]
+# Pinned to match ~/jar's pin (alleyos/alley): jar's PVM2
+# gas-conformance vectors assert exact gas for guest blobs compiled
+# by THAT rustc, and a stable bump changes guest codegen. Keeping
+# this mirror on the same toolchain keeps builds and future
+# conformance vectors aligned. Bump in lockstep with jar.
+channel = "1.95.0"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["x86_64-unknown-none"]

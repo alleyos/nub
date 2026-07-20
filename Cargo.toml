@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = [
+    "nub/nub",
+    "nub/nub-kernel",
+    "nub/nub-exec",
+    "nub/nub-recompiler-x86",
+    "nub/nub-arch-local",
+    "nub/nub-arch-x86",
+    "nub/nub-arch-x86-abi",
+    "nub/nub-host-kvm",
+    "nub/nub-host-common",
+    "nub/nub-host-guest-macro",
+    "nub/nub-build",
+    "rust/build-crate",
+]
+exclude = [
+    # Vendored guest-bin (`#![no_std]` with its own panic_handler +
+    # global_allocator). Only consumed by `nub-arch-x86` on
+    # the `cfg(target_os = "none")` cross-compile; excluding it from
+    # the workspace prevents `cargo build --workspace` (host target)
+    # from trying to link a no_std panic_impl into a std world.
+    "nub/nub-arch-guestbin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = [ "Bitarray GmbH <legal@bitarray.dev>" ]
+
+[workspace.dependencies]
+proptest = "1"
+thiserror = "2"
