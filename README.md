@@ -26,11 +26,15 @@ The caller-facing surface is `Nub<P: Personality>`, which hides the choice of su
 | [`nub/nub-linker`](nub/nub-linker) | RISC-V ELF → PVM2 linker: section concatenation, AUIPC-pair resolution, ecall rewriting, fallthrough injection, PVM2 validation. Emits a `ProgramBlob`. |
 | [`nub/nub-rt`](nub/nub-rt) / [`nub-rt-macro`](nub/nub-rt-macro) | Guest-side runtime for PVM2 programs: compiler builtins, panic handler, `#[nub_rt::endpoint(N)]`. |
 | [`nub/programs`](nub/programs) | PVM2 compute programs (sieve, keccak, blake2b, ed25519, ecrecover, Goldilocks/Poseidon2, STARK-shaped kernels). Each kernel is a plain `pub fn -> u32`, so it also compiles to native and wasm. |
-| [`nub/nub-bench`](nub/nub-bench) | Benchmarks + end-to-end coverage: every program through the interpreter, with pinned `(return_value, gas)` vectors. |
+| [`nub/nub-bench`](nub/nub-bench) | Benchmarks + end-to-end coverage: every program through the interpreter *and* the sandboxed JIT, with pinned `(return_value, gas)` vectors. |
+| [`nub/nub-flat`](nub/nub-flat) / [`nub-flat-guest-x86`](nub/nub-flat-guest-x86) | The **flat personality**: nub's reference `Personality`/`GuestPersonality` pair. One program, one frame, no capability graph — the smallest complete example, and what makes the JIT runnable standalone. |
 | [`nub/bench-compare`](nub/bench-compare) | Cross-engine comparison against native / PolkaVM / Wasmtime / Wasmer. Its own workspace, excluded — see its [README](nub/bench-compare/README.md). |
 | [`rust/build-crate`](rust/build-crate) | Generic sub-cargo build runner used by `nub-build` (separate `CARGO_TARGET_DIR`, isolated guest builds). |
 
 ## Building a personality
+
+`nub-flat` is a working example of everything below, in about 600 lines
+against JAVM's 2,700 — read it alongside this list.
 
 A downstream kernel personality is a pair of crates on either side of the sandbox boundary, plus a build step that ties them together:
 
@@ -44,6 +48,11 @@ Two substrate-wide constraints to design around:
 
 - **One live Hyperlight sandbox per process.** The guest-VA window is a single process-wide reservation; a second `create_hyperlight` — concurrent or sequential, even after dropping the first sandbox — fails loudly with `SandboxAlreadyCreated`. Personality entrypoint crates typically wrap the constructor in a process-wide singleton and reuse the one sandbox across callers.
 - **fn_id bands.** Nub owns guest-function id space `[0, 0x100)` (production RPCs in `nub-arch-x86-abi`, generic test probes in `nub-arch-x86::test_abi`); personalities own `[0x100, ...)` for their own test/bench probes.
+
+Two things `nub-flat` learned the hard way, both of which a new personality will hit:
+
+- **`mat_state` must be pre-sized to one byte per data page.** The `#PF` handler indexes it directly and does not bounds-check, so an empty `Vec` is an in-guest panic on the first fault rather than a graceful error.
+- **The ecall floor is the personality's to charge.** The interpreter bills it inside its own loop, so an `on_ecall` that returns without charging makes the two engines disagree on gas by exactly `HOST_CALL_FLOOR` — which for a metered VM means the backends are no longer interchangeable.
 
 ## Requirements
 
