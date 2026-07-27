@@ -21,7 +21,13 @@ The caller-facing surface is `Nub<P: Personality>`, which hides the choice of su
 | [`nub/nub-host-common`](nub/nub-host-common) | Types shared between host and guest (fork of `hyperlight-common`): rkyv RPC envelopes, vmem/layout/handshake constants. |
 | [`nub/nub-host-guest-macro`](nub/nub-host-guest-macro) | `#[guest_function(fn_id = N)]` proc macro (fork of `hyperlight-guest-macro`): integer-id guest-function registration. |
 | [`nub/nub-arch-guestbin`](nub/nub-arch-guestbin) | Vendored `no_std` guest runtime (fork of `hyperlight-guest-bin`): ELF entrypoint, talc allocator, fn_id dispatch table. Workspace-excluded; only built on the `x86_64-unknown-none` cross-compile. |
-| [`nub/nub-build`](nub/nub-build) | build.rs helper: cross-compiles a guest crate for `x86_64-unknown-none` and returns the ELF path. |
+| [`nub/nub-build`](nub/nub-build) | build.rs helpers: `pvm2` cross-compiles + links a PVM2 program; `arch_x86` cross-compiles a bare-metal guest kernel for `x86_64-unknown-none`. |
+| [`nub/nub-program`](nub/nub-program) | The PVM2 program blob: code, data-region geometry, entry points, plus the address-space ABI constants. `no_std`, zero deps. |
+| [`nub/nub-linker`](nub/nub-linker) | RISC-V ELF → PVM2 linker: section concatenation, AUIPC-pair resolution, ecall rewriting, fallthrough injection, PVM2 validation. Emits a `ProgramBlob`. |
+| [`nub/nub-rt`](nub/nub-rt) / [`nub-rt-macro`](nub/nub-rt-macro) | Guest-side runtime for PVM2 programs: compiler builtins, panic handler, `#[nub_rt::endpoint(N)]`. |
+| [`nub/programs`](nub/programs) | PVM2 compute programs (sieve, keccak, blake2b, ed25519, ecrecover, Goldilocks/Poseidon2, STARK-shaped kernels). Each kernel is a plain `pub fn -> u32`, so it also compiles to native and wasm. |
+| [`nub/nub-bench`](nub/nub-bench) | Benchmarks + end-to-end coverage: every program through the interpreter, with pinned `(return_value, gas)` vectors. |
+| [`nub/bench-compare`](nub/bench-compare) | Cross-engine comparison against native / PolkaVM / Wasmtime / Wasmer. Its own workspace, excluded — see its [README](nub/bench-compare/README.md). |
 | [`rust/build-crate`](rust/build-crate) | Generic sub-cargo build runner used by `nub-build` (separate `CARGO_TARGET_DIR`, isolated guest builds). |
 
 ## Building a personality
@@ -47,7 +53,21 @@ The sandbox path is **Linux x86-64 only** and needs **/dev/kvm** access (the hos
 
 ```bash
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace                # incl. the PVM2 program conformance vectors
+cargo bench -p nub-bench              # interpreter throughput + JIT emission throughput
+```
+
+`cargo test` cross-compiles every crate in `nub/programs` to the custom
+`riscv64emc-pvm2` target, so it needs the `rust-src` component. Set
+`SKIP_GUEST_BUILD=1` to skip that when you only want to typecheck.
+
+Cross-engine comparison lives in its own workspace:
+
+```bash
+cd nub/bench-compare
+cargo run --release -p bench-build    # fan every kernel out to 4 targets
+cargo run --release -- validate       # do all engines agree?
+./scripts/run.sh                      # measure -> BENCHMARKS.md
 ```
 
 The toolchain is pinned in `rust-toolchain.toml` (see the comment there — the pin tracks the alleyos/alley monorepo and bumps in lockstep with it).
@@ -72,13 +92,19 @@ This repo's master is updated directly:
 
 ```bash
 # In ~/jar (master up to date):
-git format-patch --stdout <jar-synced>..master -- nub/ rust/build-crate > /tmp/sync.patch
+git format-patch --no-renames --stdout <jar-synced>..master -- nub/ rust/build-crate > /tmp/sync.patch
 
 # In ~/nub:
 git am /tmp/sync.patch
 ```
 
 Then update `.mirror-state.toml`: set `jar-synced` to the new jar master SHA and `nub-synced` to the new local tip (the trees agree again), commit, and push origin master.
+
+`--no-renames` matters when a change *crosses* the boundary — e.g. a
+crate moving from `rust/` into `nub/`. With rename detection on, git may
+emit a `rename from` whose source the pathspec filtered out, which will
+not apply. With it off, the deletion half is simply dropped (correctly:
+the other repo never had that path) and the patch is a clean add.
 
 Fallback for gnarly patch failures (heavy conflicts, rename storms):
 
@@ -94,7 +120,7 @@ jar changes go via PR:
 
 ```bash
 # In ~/nub (master up to date):
-git format-patch --stdout <nub-synced>..master -- nub/ rust/build-crate > /tmp/sync.patch
+git format-patch --no-renames --stdout <nub-synced>..master -- nub/ rust/build-crate > /tmp/sync.patch
 
 # In ~/jar, on a branch:
 git am /tmp/sync.patch
@@ -103,6 +129,17 @@ git am /tmp/sync.patch
 Open a PR on alleyos/alley from that branch. After it merges, update `.mirror-state.toml` (`nub-synced` = the local tip that was exported, `jar-synced` = the alley merge commit), commit, and push.
 
 ### Verifying a sync point
+
+A manifest inside the boundary must never inherit a dependency with
+`workspace = true` unless *both* root manifests define it. `thiserror`
+and `proptest` qualify; anything else must be a path dep, or the
+standalone build fails to load the manifest.
+
+Guest dependency versions are pinned exactly (`=x.y.z`) in
+`nub/programs/*`. The `(return_value, gas)` vectors depend on the
+emitted instruction stream, so a caret range letting the two repos
+resolve different patch releases silently changes them — it moved
+ed25519's gas by 3.3x once.
 
 At every sync point the mirrored trees must be byte-identical:
 

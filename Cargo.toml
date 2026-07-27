@@ -12,6 +12,22 @@ members = [
     "nub/nub-host-common",
     "nub/nub-host-guest-macro",
     "nub/nub-build",
+    "nub/nub-program",
+    "nub/nub-linker",
+    "nub/nub-rt",
+    "nub/nub-rt-macro",
+    "nub/nub-bench",
+    "nub/programs/blake2b",
+    "nub/programs/ecrecover",
+    "nub/programs/ed25519",
+    "nub/programs/fri-fold-tree",
+    "nub/programs/goldilocks-mul",
+    "nub/programs/goldilocks-poseidon2",
+    "nub/programs/keccak",
+    "nub/programs/mini-verifier",
+    "nub/programs/poly-eval",
+    "nub/programs/poseidon2-perm",
+    "nub/programs/prime-sieve",
     "rust/build-crate",
 ]
 exclude = [
@@ -21,6 +37,12 @@ exclude = [
     # the workspace prevents `cargo build --workspace` (host target)
     # from trying to link a no_std panic_impl into a std world.
     "nub/nub-arch-guestbin",
+    # Multi-engine benchmark comparison. Its own workspace + Cargo.lock so
+    # polkavm/wasmtime/wasmer (hundreds of crates) never enter this
+    # lockfile, `cargo audit`, or the SBOM. It ships nothing; it only
+    # measures. Build it with
+    # `--manifest-path nub/bench-compare/Cargo.toml`.
+    "nub/bench-compare",
 ]
 
 [workspace.package]

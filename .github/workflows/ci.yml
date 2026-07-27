@@ -34,11 +34,16 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        # Lint only typechecks; the RISC-V cross-compiles are the test
+        # job's business and would roughly double this job's wall time.
+        env:
+          SKIP_GUEST_BUILD: "1"
 
       - name: cargo doc
         run: cargo doc --locked --workspace --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+          SKIP_GUEST_BUILD: "1"
 
   test:
     name: Tests
@@ -46,9 +51,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `rust-src` and the bare-metal target are required by the guest
+      # builds: `nub-bench` cross-compiles every program in `nub/programs`
+      # to the custom `riscv64emc-pvm2` target, which needs `-Zbuild-std`
+      # and therefore a source sysroot. The `toolchain:` input overrides
+      # rust-toolchain.toml, so its `components`/`targets` do not apply.
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
+          components: rust-src
+          targets: x86_64-unknown-none
 
       - uses: Swatinem/rust-cache@v2
 
