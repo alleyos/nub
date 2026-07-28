@@ -16,10 +16,10 @@ paths = ["nub/", "rust/build-crate/"]
 # fully reflected here. Updated by whoever completes a sync:
 # jar → nub sets it to the jar master SHA just imported; nub → jar
 # sets it to the alley merge commit of the exported PR.
-jar-synced = "5c15a4f4a07649181669d19b684792f37caf48e7"
+jar-synced = "29aec8ee1ad75ebc248a9995984814695a411341"
 # Last commit on this repo's master fully reflected in alley.
 # Updated at the same moments: jar → nub sets it to the new local
 # tip (the trees agree again after the import); nub → jar sets it
 # to the local tip the merged PR exported. Initial value = the
 # git-filter-repo extraction tip.
-nub-synced = "67394b1cf007cb057aed37e021875a8ae015f767"
+nub-synced = "20cd65df3044277af97b1d062b4272d07bcd24a1"
