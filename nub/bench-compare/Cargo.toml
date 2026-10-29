@@ -48,7 +48,7 @@ toml = "0.8"
 libc = "0.2"
 
 polkavm = { version = "0.36", optional = true }
-wasmtime = { version = "47", default-features = false, features = ["cranelift", "winch", "runtime", "std", "gc", "gc-drc", "component-model"], optional = true }
+wasmtime = { version = "49", default-features = false, features = ["cranelift", "winch", "runtime", "std", "gc", "gc-drc", "component-model"], optional = true }
 wasmer = { version = "7", default-features = false, features = ["std", "singlepass", "sys"], optional = true }
 wasmer-compiler-singlepass = { version = "7", optional = true }
 wasmi = { version = "1.1", optional = true }
